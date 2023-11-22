@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5ddc86fef92487b4ca4ef35aa5aa52ec0fad85f048ec46faeb7e68eea23d9732 # shrinks to operations = [IncMut, SetNoAlias, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, UnsetNoAlias, DecShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared, IncShared]
+cc b8e61df9b72c6fd433de0d4e3aa5e2ab4f5ac9cc879b010f2a80493fe702bcb7 # shrinks to operations = [IncShared, DecShared, DecShared, IncMut, SetNoAlias, IncShared, UnsetNoAlias, IncShared, DecShared]
+cc bf2bae77501a8c0931eda312609726d9229fbeca4d981bc791e4b1780b627e96 # shrinks to operations = [IncShared, DecShared, DecShared]
+cc 0f8ea34110c5e374507ae54865280e739acef1aa49b0f6a1336f2766716ad47b # shrinks to operations = [IncMut, IncMut, DecMut]

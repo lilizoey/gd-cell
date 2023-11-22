@@ -1,136 +1,21 @@
 #![feature(strict_provenance)]
 
+mod borrow_state;
+mod guards;
+mod mock;
+
 use std::{
-    cell::UnsafeCell,
-    marker::{PhantomData, PhantomPinned},
-    mem::ManuallyDrop,
-    ops::{Deref, DerefMut},
-    pin::Pin,
-    sync::Mutex,
+    cell::UnsafeCell, error::Error, marker::PhantomPinned, pin::Pin, ptr::NonNull, sync::Mutex,
 };
 
-#[derive(Debug)]
-struct BorrowState {
-    /// The number of `&T` references that are tracked.
-    shared_count: usize,
-    /// The number of `&mut T` references that are tracked.
-    mut_count: usize,
-    /// The number of `&mut T` references that cannot be aliased.
-    non_aliasing_count: usize,
-}
-
-impl BorrowState {
-    pub fn new() -> Self {
-        Self {
-            shared_count: 0,
-            mut_count: 0,
-            non_aliasing_count: 0,
-        }
-    }
-
-    pub fn possibly_aliasing_count(&self) -> usize {
-        self.mut_count - self.non_aliasing_count
-    }
-
-    pub fn may_ref(&self) -> bool {
-        self.possibly_aliasing_count() == 0
-    }
-
-    pub fn may_mut_ref(&self) -> bool {
-        self.possibly_aliasing_count() == 0 && self.shared_count == 0
-    }
-
-    pub fn increment_shared(&mut self) -> Result<(), String> {
-        if !self.may_ref() {
-            return Err(
-                "cannot increment shared as there exist possibly aliasing mutable references"
-                    .into(),
-            );
-        }
-
-        self.shared_count = self
-            .shared_count
-            .checked_add(1)
-            .ok_or("could not increment shared count")?;
-        Ok(())
-    }
-
-    pub fn decrement_shared(&mut self) {
-        debug_assert_eq!(self.possibly_aliasing_count(), 0);
-        self.shared_count = self.shared_count.checked_sub(1).unwrap();
-    }
-
-    pub fn increment_mut(&mut self) -> Result<(), String> {
-        if self.possibly_aliasing_count() != 0 {
-            return Err(
-                "cannot increment mut as there exist possibly aliasing mutable references".into(),
-            );
-        }
-
-        if self.shared_count != 0 {
-            return Err("cannot increment mut as there exist shared references".into());
-        }
-
-        self.mut_count = self
-            .mut_count
-            .checked_add(1)
-            .ok_or("could not increment mut count")?;
-
-        Ok(())
-    }
-
-    pub fn decrement_mut(&mut self) {
-        debug_assert_eq!(
-            self.mut_count,
-            self.non_aliasing_count + 1,
-            "must only decrement the mut counter when the current borrow is accessible"
-        );
-
-        self.mut_count = self.mut_count.checked_sub(1).unwrap();
-        self.non_aliasing_count = self.mut_count;
-    }
-
-    pub fn increment_non_aliasing(&mut self) -> Result<(), String> {
-        if self.possibly_aliasing_count() == 0 {
-            return Err("cannot set mut reference as non-aliasing when there are no possibly aliasing pointers".into());
-        }
-
-        self.non_aliasing_count = self
-            .non_aliasing_count
-            .checked_add(1)
-            .ok_or("could not increment non-aliasing count")?;
-        Ok(())
-    }
-
-    pub fn decrement_non_aliasing(&mut self) -> Result<(), String> {
-        if self.possibly_aliasing_count() > 0 {
-            return Err("cannot have more than 1 possibly aliasing pointers".into());
-        }
-
-        if self.non_aliasing_count == 0 {
-            return Err(
-                "cannot mark mut pointer as aliasing when there are no possibly aliasing pointers"
-                    .into(),
-            );
-        }
-
-        self.non_aliasing_count = self
-            .non_aliasing_count
-            .checked_sub(1)
-            .ok_or("could not decrement non-aliasing count")?;
-        Ok(())
-    }
-
-    pub fn mut_count(&self) -> usize {
-        self.mut_count
-    }
-}
+use borrow_state::BorrowState;
+use guards::{GdMut, GdRef, NonAliasingGuard};
 
 #[derive(Debug)]
 pub struct GdCell<T> {
     state: Mutex<BorrowState>,
     value: UnsafeCell<T>,
-    current_ptr: Mutex<Vec<*mut T>>,
+    current_ptr: Mutex<Vec<NonNull<T>>>,
     _pin: PhantomPinned,
 }
 
@@ -144,32 +29,42 @@ impl<T> GdCell<T> {
         }
     }
 
-    pub fn gd_ref(self: Pin<&Self>) -> Result<GdRef<'_, T>, String> {
+    pub fn gd_ref(self: Pin<&Self>) -> Result<GdRef<'_, T>, Box<dyn Error>> {
         self.state.lock().unwrap().increment_shared()?;
 
-        Ok(GdRef {
-            state: &self.get_ref().state,
-            value: self.get_value(),
-        })
+        // SAFETY:
+        // `increment_shared` succeeded, therefore there cannot currently be any aliasing mutable references.
+        unsafe { Ok(GdRef::new(&self.get_ref().state, self.get_value())) }
     }
 
-    pub fn gd_mut(self: Pin<&Self>) -> Result<GdMut<'_, T>, String> {
+    pub fn gd_mut(self: Pin<&Self>) -> Result<GdMut<'_, T>, Box<dyn Error>> {
         let mut guard = self.state.lock().unwrap();
         guard.increment_mut()?;
         let count = guard.mut_count();
 
-        Ok(GdMut {
-            state: &self.get_ref().state,
-            count,
-            value: self.get_value(),
-        })
+        // SAFETY:
+        // `increment_mut` succeeded, therefore any existing mutable references do not alias, and no new
+        // references may be made unless this one is guaranteed not to alias those.
+        //
+        // This is the case because the only way for a new `GdMut` or `GdRef` to be made after this, then
+        // either this guard has to be dropped or `set_non_aliasing` must be called.
+        //
+        // If this guard is dropped, then we dont need to worry.
+        //
+        // If `set_non_aliasing` is called, then either a mutable reference from this guard is passed in.
+        // In which case, we cannot use this guard again until the resulting non-aliasing guard is dropped.
+        //
+        // We cannot pass in a different mutable reference, since `set_non_aliasing` ensures any references
+        // matches the ones this one would return. And only one mutable reference to the same value can exist
+        // since we cannot have any other aliasing mutable references around to pass in.
+        unsafe { Ok(GdMut::new(&self.get_ref().state, count, self.get_value())) }
     }
 
-    fn get_value(self: Pin<&Self>) -> *mut T {
+    fn get_value(self: Pin<&Self>) -> NonNull<T> {
         let mut ptr_vec = self.current_ptr.lock().unwrap();
 
         if ptr_vec.is_empty() {
-            ptr_vec.push(self.value.get())
+            ptr_vec.push(NonNull::new(self.value.get()).unwrap())
         }
 
         *ptr_vec.last().unwrap()
@@ -178,21 +73,16 @@ impl<T> GdCell<T> {
     /// Set the current mutable borrow as not aliasing any other references.
     ///
     /// Will error if there is no current possibly aliasing mutable borrow.
-    ///
-    /// # Safety
-    ///
-    /// The current mutable borrow, and any derived references, must *not* be accessed between this call, and
-    /// a future call to `Self::unset_non_aliasing()`.
     pub fn set_non_aliasing<'a, 'b>(
         self: Pin<&'a Self>,
         current_ref: &'b mut T,
-    ) -> Result<NonAliasingGuard<'b, T>, String>
+    ) -> Result<NonAliasingGuard<'b, T>, Box<dyn Error>>
     where
         'a: 'b,
     {
         let mut current_ptr_vec = self.current_ptr.lock().unwrap();
         let current_ptr = *current_ptr_vec.last().unwrap();
-        let ptr = current_ref as *mut T;
+        let ptr = NonNull::from(current_ref);
 
         if current_ptr != ptr {
             // it is likely not unsound for this to happen, but it's unexpected
@@ -200,90 +90,15 @@ impl<T> GdCell<T> {
         }
 
         let mut state_guard = self.state.lock().unwrap();
-        let result = state_guard.increment_non_aliasing();
+        state_guard.set_non_aliasing()?;
         current_ptr_vec.push(ptr);
         drop(state_guard);
         drop(current_ptr_vec);
 
-        result.map(|_| NonAliasingGuard {
-            state: &self.get_ref().state,
-            current_ptr: &self.get_ref().current_ptr,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct NonAliasingGuard<'a, T> {
-    state: &'a Mutex<BorrowState>,
-    current_ptr: &'a Mutex<Vec<*mut T>>,
-}
-
-impl<'a, T> Drop for NonAliasingGuard<'a, T> {
-    fn drop(&mut self) {
-        let Self { state, current_ptr } = self;
-        let mut state_guard = state.lock().unwrap();
-        let mut ptr_guard = current_ptr.lock().unwrap();
-        state_guard.decrement_non_aliasing().unwrap();
-        let ptr = ptr_guard.pop().unwrap();
-        drop(state_guard);
-        drop(ptr_guard);
-    }
-}
-
-#[derive(Debug)]
-pub struct GdRef<'a, T> {
-    state: &'a Mutex<BorrowState>,
-    value: *mut T,
-}
-
-impl<'a, T> Deref for GdRef<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.value }
-    }
-}
-
-impl<'a, T> Drop for GdRef<'a, T> {
-    fn drop(&mut self) {
-        self.state.lock().unwrap().decrement_shared()
-    }
-}
-
-#[derive(Debug)]
-pub struct GdMut<'a, T> {
-    state: &'a Mutex<BorrowState>,
-    count: usize,
-    value: *mut T,
-}
-
-impl<'a, T> Deref for GdMut<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        let count = self.state.lock().unwrap().mut_count();
-        assert_eq!(
-            self.count, count,
-            "attempted to access the non-current mutable borrow"
-        );
-        unsafe { &*self.value }
-    }
-}
-
-impl<'a, T> DerefMut for GdMut<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let count = self.state.lock().unwrap().mut_count();
-        assert_eq!(
-            self.count, count,
-            "attempted to access the non-current mutable borrow"
-        );
-        unsafe { &mut *self.value }
-    }
-}
-
-impl<'a, T> Drop for GdMut<'a, T> {
-    fn drop(&mut self) {
-        self.state.lock().unwrap().decrement_mut()
+        Ok(NonAliasingGuard::new(
+            &self.get_ref().state,
+            &self.get_ref().current_ptr,
+        ))
     }
 }
 
