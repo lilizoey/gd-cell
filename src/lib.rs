@@ -1,15 +1,12 @@
-#![feature(strict_provenance)]
-
 mod borrow_state;
 mod guards;
-mod mock;
 
 use std::{
     cell::UnsafeCell, error::Error, marker::PhantomPinned, pin::Pin, ptr::NonNull, sync::Mutex,
 };
 
 use borrow_state::BorrowState;
-use guards::{GdMut, GdRef, NonAliasingGuard};
+pub use guards::{GdMut, GdRef, NonAliasingGuard};
 
 #[derive(Debug)]
 pub struct GdCell<T> {
@@ -99,6 +96,12 @@ impl<T> GdCell<T> {
             &self.get_ref().state,
             &self.get_ref().current_ptr,
         ))
+    }
+
+    pub fn is_currently_bound(self: Pin<&Self>) -> bool {
+        let guard = self.state.lock().unwrap();
+
+        guard.shared_count() > 0 || guard.mut_count() > 0
     }
 }
 

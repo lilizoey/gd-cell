@@ -6,7 +6,7 @@ use std::{
     sync::{atomic::AtomicUsize, Mutex, OnceLock},
 };
 
-use crate::{guards::NonAliasingGuard, GdCell};
+use gd_cell::{GdCell, NonAliasingGuard};
 
 struct InstanceBinding(*mut ());
 
@@ -41,7 +41,7 @@ fn register_instance<T>(instance: T) -> usize {
     guard.insert(key, InstanceBinding(ptr));
     key
 }
-
+/*
 unsafe fn free_instance<T>(key: usize) {
     let binding = binding();
     let mut guard = binding.lock().unwrap();
@@ -52,10 +52,10 @@ unsafe fn free_instance<T>(key: usize) {
 
     let storage = unsafe { Box::from_raw(ptr) };
 }
-
+*/
 unsafe fn get_instance<'a, T>(key: usize) -> &'a InstanceStorage<T> {
     let binding = binding();
-    let mut guard = binding.lock().unwrap();
+    let guard = binding.lock().unwrap();
 
     let instance = guard.get(&key).unwrap();
 
@@ -96,14 +96,14 @@ impl<T> Base<T> {
 
 struct BaseGuard<'a, T> {
     instance_id: usize,
-    non_aliasing_guard: NonAliasingGuard<'a, T>,
+    _non_aliasing_guard: NonAliasingGuard<'a, T>,
 }
 
 impl<'a, T> BaseGuard<'a, T> {
     fn new<'b>(instance_id: usize, non_aliasing_guard: NonAliasingGuard<'a, T>) -> Self {
         Self {
             instance_id,
-            non_aliasing_guard,
+            _non_aliasing_guard: non_aliasing_guard,
         }
     }
 
